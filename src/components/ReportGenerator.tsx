@@ -21,10 +21,18 @@ export default function ReportGenerator({
       report_metadata: {
         generated_at: new Date().toISOString(),
         model_version: scanResult.modelVersion,
+        analysis_id: scanResult.analysisId,
+        image_hash: scanResult.imageHash,
         confidence_threshold: scanResult.threshold,
         processing_time_ms: scanResult.processingTimeMs,
         image_name: imageName,
         image_dimensions: `${scanResult.imageWidth}x${scanResult.imageHeight}`,
+      },
+      validation: {
+        is_valid: scanResult.validation.isValid,
+        confidence: scanResult.validation.confidence,
+        reason: scanResult.validation.reason,
+        metrics: scanResult.validation.metrics,
       },
       location: geo
         ? {
@@ -35,6 +43,32 @@ export default function ReportGenerator({
             survey_vessel: geo.surveyVessel,
           }
         : null,
+      fusion: {
+        decision: scanResult.fusion.decision,
+        agreement_score: scanResult.fusion.agreementScore,
+        yolo_agreement: scanResult.fusion.yoloAgreement,
+        rcnn_agreement: scanResult.fusion.rcnnAgreement,
+        unet_agreement: scanResult.fusion.unetAgreement,
+        notes: scanResult.fusion.disagreementNotes,
+        summary: scanResult.fusion.summary,
+      },
+      models: {
+        yolo: {
+          detections: scanResult.yolo.detections.length,
+          avg_confidence: scanResult.yolo.confidence,
+          processing_ms: scanResult.yolo.processingTimeMs,
+        },
+        unet: {
+          coverage_percent: scanResult.segmentation.coveragePercent,
+          region_count: scanResult.segmentation.regionCount,
+          processing_ms: scanResult.segmentation.processingTimeMs,
+        },
+        rcnn: {
+          detections: scanResult.rcnn.detections.length,
+          avg_confidence: scanResult.rcnn.confidence,
+          processing_ms: scanResult.rcnn.processingTimeMs,
+        },
+      },
       summary: {
         total_detections: detections.length,
         average_confidence:
@@ -52,6 +86,7 @@ export default function ReportGenerator({
         label_display: d.labelDisplay,
         confidence_pct: d.confidence,
         is_anomaly: d.isAnomaly,
+        source: d.source,
         bounding_box: {
           x: d.bbox.x,
           y: d.bbox.y,
@@ -66,6 +101,7 @@ export default function ReportGenerator({
           ? { lat: geo.latitude, lng: geo.longitude }
           : null,
       })),
+      assistant_analysis: scanResult.assistantAnalysis,
     };
   };
 
@@ -89,11 +125,12 @@ export default function ReportGenerator({
         'Label',
         'Confidence (%)',
         'Is Anomaly',
+        'Source',
         'BBox X',
         'BBox Y',
         'BBox W',
         'BBox H',
-        'Area (m²)',
+        'Area (m2)',
         'Shadow',
         'Brightness',
         'Texture',
@@ -106,6 +143,7 @@ export default function ReportGenerator({
         d.labelDisplay,
         String(d.confidence),
         String(d.isAnomaly),
+        d.source,
         String(d.bbox.x),
         String(d.bbox.y),
         String(d.bbox.width),

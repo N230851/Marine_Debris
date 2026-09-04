@@ -26,15 +26,64 @@ export interface Detection {
   shadow_detected: boolean;
   brightness_mean: number;
   texture_score: number;
+  source: 'yolo' | 'rcnn' | 'fusion';
+}
+
+export interface ModelDetection {
+  model: 'yolo' | 'unet' | 'rcnn';
+  detections: Detection[];
+  processingTimeMs: number;
+  maskCoverage?: number;
+  confidence: number;
+}
+
+export interface SegmentationResult {
+  maskDataUrl: string;
+  coveragePercent: number;
+  regionCount: number;
+  processingTimeMs: number;
+}
+
+export interface FusionResult {
+  finalDetections: Detection[];
+  agreementScore: number;
+  yoloAgreement: number;
+  rcnnAgreement: number;
+  unetAgreement: number;
+  disagreementNotes: string[];
+  decision: 'consensus' | 'partial_agreement' | 'disagreement' | 'no_detection';
+  summary: string;
+}
+
+export interface ValidationResult {
+  isValid: boolean;
+  confidence: number;
+  reason: string;
+  metrics: {
+    grayscaleRatio: number;
+    edgeDensity: number;
+    textureVariance: number;
+    histogramSpread: number;
+    aspectRatio: number;
+  };
 }
 
 export interface ScanResult {
+  analysisId: string;
+  imageHash: string;
   detections: Detection[];
   imageWidth: number;
   imageHeight: number;
   processingTimeMs: number;
   modelVersion: string;
   threshold: number;
+  yolo: ModelDetection;
+  unet: ModelDetection;
+  rcnn: ModelDetection;
+  segmentation: SegmentationResult;
+  fusion: FusionResult;
+  validation: ValidationResult;
+  assistantAnalysis: string;
 }
 
 export interface GeoLocation {
@@ -57,6 +106,17 @@ export interface ScanRecord {
   average_confidence: number;
   detections: Detection[];
   created_at: string;
+  model_used: string;
+  yolo_detections: Detection[];
+  rcnn_detections: Detection[];
+  unet_mask: string | null;
+  model_agreement: number;
+  is_sonar_validated: boolean;
+  validation_confidence: number;
+  validation_reason: string | null;
+  fusion_result: FusionResult | null;
+  assistant_analysis: string | null;
+  image_hash: string | null;
 }
 
 export const LABEL_DISPLAY: Record<DetectionLabel, string> = {
