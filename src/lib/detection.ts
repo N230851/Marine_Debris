@@ -23,7 +23,7 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-function imageToCanvas(img: HTMLImageElement, maxDim = 1024): HTMLCanvasElement {
+function imageToCanvas(img: HTMLImageElement, maxDim = 512): HTMLCanvasElement {
   const scale = Math.min(maxDim / img.naturalWidth, maxDim / img.naturalHeight, 1);
   const w = Math.round(img.naturalWidth * scale);
   const h = Math.round(img.naturalHeight * scale);
@@ -97,25 +97,31 @@ function localVariance(
   radius: number
 ): Float32Array {
   const variance = new Float32Array(w * h);
+  // Use integral images (summed-area tables) for O(1) windowed variance
+  const integral = new Float64Array((w + 1) * (h + 1));
+  const integralSq = new Float64Array((w + 1) * (h + 1));
   for (let y = 0; y < h; y++) {
+    let rowSum = 0;
+    let rowSumSq = 0;
     for (let x = 0; x < w; x++) {
-      let sum = 0;
-      let sumSq = 0;
-      let count = 0;
-      for (let dy = -radius; dy <= radius; dy++) {
-        for (let dx = -radius; dx <= radius; dx++) {
-          const nx = x + dx;
-          const ny = y + dy;
-          if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
-            const v = gray[ny * w + nx];
-            sum += v;
-            sumSq += v * v;
-            count++;
-          }
-        }
-      }
-      const mean = sum / count;
-      variance[y * w + x] = Math.max(0, sumSq / count - mean * mean);
+      const v = gray[y * w + x];
+      rowSum += v;
+      rowSumSq += v * v;
+      integral[(y + 1) * (w + 1) + (x + 1)] = integral[y * (w + 1) + (x + 1)] + rowSum;
+      integralSq[(y + 1) * (w + 1) + (x + 1)] = integralSq[y * (w + 1) + (x + 1)] + rowSumSq;
+    }
+  }
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - radius);
+    const y1 = Math.min(h - 1, y + radius);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(w - 1, x + radius);
+      const count = (y1 - y0 + 1) * (x1 - x0 + 1);
+      const s = integral[(y1 + 1) * (w + 1) + (x1 + 1)] - integral[y0 * (w + 1) + (x1 + 1)] - integral[(y1 + 1) * (w + 1) + x0] + integral[y0 * (w + 1) + x0];
+      const sq = integralSq[(y1 + 1) * (w + 1) + (x1 + 1)] - integralSq[y0 * (w + 1) + (x1 + 1)] - integralSq[(y1 + 1) * (w + 1) + x0] + integralSq[y0 * (w + 1) + x0];
+      const mean = s / count;
+      variance[y * w + x] = Math.max(0, sq / count - mean * mean);
     }
   }
   return variance;
@@ -149,7 +155,7 @@ function histogram(gray: Float32Array): { hist: number[]; spread: number; mean: 
 
 export function validateSonar(gray: Float32Array, w: number, h: number): ValidationResult {
   const edges = sobelEdges(gray, w, h);
-  const variance = localVariance(gray, w, h, 4);
+  const variance = localVariance(gray, w, h, 3);
   const { spread, mean, std } = histogram(gray);
 
   // Sonar images are predominantly grayscale (low color saturation already
@@ -230,6 +236,14 @@ export function validateSonar(gray: Float32Array, w: number, h: number): Validat
   }
 
   return { isValid, confidence, reason, metrics };
+}
+
+function arrayMax(arr: Float32Array): number {
+  let max = 0;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i] > max) max = arr[i];
+  }
+  return max;
 }
 
 // ─── Connected component labeling for ROI detection ───────────────
@@ -321,8 +335,8 @@ function detectROIs(
   h: number
 ): Region[] {
   // Create a saliency mask: pixels that have high edge or high texture variance
-  const edgeMax = Math.max(...edges.slice(0, Math.min(edges.length, 100000)));
-  const varMax = Math.max(...variance.slice(0, Math.min(variance.length, 100000)));
+  const edgeMax = arrayMax(edges);
+  const varMax = arrayMax(variance);
 
   const mask = new Uint8Array(w * h);
   const edgeThresh = edgeMax * 0.25;
@@ -455,8 +469,8 @@ function runYoloDetection(
 ): ModelDetection {
   const start = performance.now();
   const regions = detectROIs(gray, edges, variance, w, h);
-  const edgeMax = Math.max(...edges.slice(0, Math.min(edges.length, 50000)));
-  const varMax = Math.max(...variance.slice(0, Math.min(variance.length, 50000)));
+  const edgeMax = arrayMax(edges);
+  const varMax = arrayMax(variance);
 
   const detections: Detection[] = regions.map((region, i) => {
     const { label, isAnomaly } = classifyRegion(region, w, h);
@@ -497,8 +511,8 @@ function runUnetSegmentation(
   const start = performance.now();
 
   // Create segmentation mask: pixels with high edge or variance are "debris"
-  const edgeMax = Math.max(...edges.slice(0, Math.min(edges.length, 50000)));
-  const varMax = Math.max(...variance.slice(0, Math.min(variance.length, 50000)));
+  const edgeMax = arrayMax(edges);
+  const varMax = arrayMax(variance);
   const edgeThresh = edgeMax * 0.2;
   const varThresh = varMax * 0.15;
 
@@ -561,8 +575,8 @@ function runRcnnDetection(
   const start = performance.now();
 
   // R-CNN uses region proposals — slightly different thresholding
-  const edgeMax = Math.max(...edges.slice(0, Math.min(edges.length, 50000)));
-  const varMax = Math.max(...variance.slice(0, Math.min(variance.length, 50000)));
+  const edgeMax = arrayMax(edges);
+  const varMax = arrayMax(variance);
 
   // More selective than YOLO (higher thresholds)
   const mask = new Uint8Array(w * h);
@@ -805,7 +819,10 @@ export async function runFullAnalysis(
 
   // Feature extraction
   const edges = sobelEdges(gray, w, h);
-  const variance = localVariance(gray, w, h, 4);
+  const variance = localVariance(gray, w, h, 3);
+
+  // Yield to event loop before heavy model processing
+  await new Promise((r) => setTimeout(r, 0));
 
   // Run three models
   const yolo = runYoloDetection(gray, edges, variance, w, h);
