@@ -11,7 +11,6 @@ import type {
 import { LABEL_DISPLAY } from '@/types';
 
 const MODEL_VERSION = 'DeepScan-MultiModel-v2.0';
-const MAX_DIM = 480;
 
 // ─── Image loading & pixel extraction ───────────────────────────
 
@@ -24,10 +23,10 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-function imageToCanvas(img: HTMLImageElement, maxDim: number): HTMLCanvasElement {
+function imageToCanvas(img: HTMLImageElement, maxDim = 512): HTMLCanvasElement {
   const scale = Math.min(maxDim / img.naturalWidth, maxDim / img.naturalHeight, 1);
-  const w = Math.max(1, Math.round(img.naturalWidth * scale));
-  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const w = Math.round(img.naturalWidth * scale);
+  const h = Math.round(img.naturalHeight * scale);
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;
@@ -89,7 +88,7 @@ function sobelEdges(gray: Float32Array, w: number, h: number): Float32Array {
   return edges;
 }
 
-// ─── Local texture variance (integral-image O(n) approach) ────────
+// ─── Local texture variance ──────────────────────────────────────
 
 function localVariance(
   gray: Float32Array,
@@ -98,9 +97,9 @@ function localVariance(
   radius: number
 ): Float32Array {
   const variance = new Float32Array(w * h);
-  const W = w + 1;
-  const integral = new Float64Array(W * (h + 1));
-  const integralSq = new Float64Array(W * (h + 1));
+  // Use integral images (summed-area tables) for O(1) windowed variance
+  const integral = new Float64Array((w + 1) * (h + 1));
+  const integralSq = new Float64Array((w + 1) * (h + 1));
   for (let y = 0; y < h; y++) {
     let rowSum = 0;
     let rowSumSq = 0;
@@ -108,8 +107,8 @@ function localVariance(
       const v = gray[y * w + x];
       rowSum += v;
       rowSumSq += v * v;
-      integral[(y + 1) * W + (x + 1)] = integral[y * W + (x + 1)] + rowSum;
-      integralSq[(y + 1) * W + (x + 1)] = integralSq[y * W + (x + 1)] + rowSumSq;
+      integral[(y + 1) * (w + 1) + (x + 1)] = integral[y * (w + 1) + (x + 1)] + rowSum;
+      integralSq[(y + 1) * (w + 1) + (x + 1)] = integralSq[y * (w + 1) + (x + 1)] + rowSumSq;
     }
   }
   for (let y = 0; y < h; y++) {
@@ -119,16 +118,8 @@ function localVariance(
       const x0 = Math.max(0, x - radius);
       const x1 = Math.min(w - 1, x + radius);
       const count = (y1 - y0 + 1) * (x1 - x0 + 1);
-      const s =
-        integral[(y1 + 1) * W + (x1 + 1)] -
-        integral[y0 * W + (x1 + 1)] -
-        integral[(y1 + 1) * W + x0] +
-        integral[y0 * W + x0];
-      const sq =
-        integralSq[(y1 + 1) * W + (x1 + 1)] -
-        integralSq[y0 * W + (x1 + 1)] -
-        integralSq[(y1 + 1) * W + x0] +
-        integralSq[y0 * W + x0];
+      const s = integral[(y1 + 1) * (w + 1) + (x1 + 1)] - integral[y0 * (w + 1) + (x1 + 1)] - integral[(y1 + 1) * (w + 1) + x0] + integral[y0 * (w + 1) + x0];
+      const sq = integralSq[(y1 + 1) * (w + 1) + (x1 + 1)] - integralSq[y0 * (w + 1) + (x1 + 1)] - integralSq[(y1 + 1) * (w + 1) + x0] + integralSq[y0 * (w + 1) + x0];
       const mean = s / count;
       variance[y * w + x] = Math.max(0, sq / count - mean * mean);
     }
@@ -138,7 +129,7 @@ function localVariance(
 
 // ─── Histogram analysis ──────────────────────────────────────────
 
-function histogram(gray: Float32Array): { spread: number; mean: number } {
+function histogram(gray: Float32Array): { hist: number[]; spread: number; mean: number; std: number } {
   const hist = new Array(256).fill(0);
   let sum = 0;
   for (let i = 0; i < gray.length; i++) {
@@ -147,11 +138,104 @@ function histogram(gray: Float32Array): { spread: number; mean: number } {
     sum += gray[i];
   }
   const mean = sum / gray.length;
+  let varSum = 0;
+  for (let i = 0; i < gray.length; i++) {
+    varSum += (gray[i] - mean) ** 2;
+  }
+  const std = Math.sqrt(varSum / gray.length);
+
   let nonZeroBins = 0;
   for (let i = 0; i < 256; i++) {
     if (hist[i] > gray.length * 0.0005) nonZeroBins++;
   }
-  return { spread: nonZeroBins, mean };
+  return { hist, spread: nonZeroBins, mean, std };
+}
+
+// ─── Sonar image validation ──────────────────────────────────────
+
+export function validateSonar(gray: Float32Array, w: number, h: number): ValidationResult {
+  const edges = sobelEdges(gray, w, h);
+  const variance = localVariance(gray, w, h, 3);
+  const { spread, mean, std } = histogram(gray);
+
+  // Sonar images are predominantly grayscale (low color saturation already
+  // guaranteed since we converted). Check grayscale ratio implicitly.
+  const edgeMean = edges.reduce((a, b) => a + b, 0) / edges.length;
+  const varMean = variance.reduce((a, b) => a + b, 0) / variance.length;
+
+  // Edge density: sonar images have moderate edge density from object outlines
+  let edgePixels = 0;
+  for (let i = 0; i < edges.length; i++) {
+    if (edges[i] > 40) edgePixels++;
+  }
+  const edgeDensity = edgePixels / edges.length;
+
+  // Sonar images typically: moderate brightness (not too dark, not too bright),
+  // moderate texture variance, moderate histogram spread, specific aspect ratios
+  const aspectRatio = w / h;
+
+  const metrics = {
+    grayscaleRatio: 1.0, // Already grayscale-converted
+    edgeDensity,
+    textureVariance: varMean,
+    histogramSpread: spread,
+    aspectRatio,
+  };
+
+  // Validation scoring
+  let score = 0;
+  const reasons: string[] = [];
+
+  // Edge density check (sonar has structured edges)
+  if (edgeDensity > 0.02 && edgeDensity < 0.35) {
+    score += 25;
+  } else if (edgeDensity < 0.02) {
+    reasons.push('insufficient structural detail');
+  } else {
+    reasons.push('edge pattern inconsistent with sonar');
+  }
+
+  // Brightness check (sonar typically mid-range, not pure black/white)
+  if (mean > 20 && mean < 235) {
+    score += 20;
+  } else {
+    reasons.push('brightness range atypical for sonar imagery');
+  }
+
+  // Texture variance (sonar has distinctive texture from acoustic returns)
+  if (varMean > 50 && varMean < 8000) {
+    score += 25;
+  } else if (varMean < 50) {
+    reasons.push('insufficient acoustic texture');
+  } else {
+    reasons.push('texture pattern inconsistent with sonar');
+  }
+
+  // Histogram spread (sonar images use a decent range of gray values)
+  if (spread > 40 && spread < 240) {
+    score += 15;
+  } else {
+    reasons.push('tonal range atypical for sonar');
+  }
+
+  // Aspect ratio (sonar images are often wide strips)
+  if (aspectRatio > 0.5 && aspectRatio < 4.0) {
+    score += 15;
+  } else {
+    reasons.push('aspect ratio unusual for sonar imagery');
+  }
+
+  const isValid = score >= 60;
+  const confidence = Math.min(99, score);
+
+  let reason: string;
+  if (isValid) {
+    reason = `Image validated as side-scan sonar (confidence: ${confidence}%). Edge density: ${(edgeDensity * 100).toFixed(1)}%, texture variance: ${varMean.toFixed(0)}, tonal range: ${spread} levels.`;
+  } else {
+    reason = `Image does not appear to be side-scan sonar. ${reasons.join('; ')}. Edge density: ${(edgeDensity * 100).toFixed(1)}%, texture variance: ${varMean.toFixed(0)}.`;
+  }
+
+  return { isValid, confidence, reason, metrics };
 }
 
 function arrayMax(arr: Float32Array): number {
@@ -162,86 +246,7 @@ function arrayMax(arr: Float32Array): number {
   return max;
 }
 
-// ─── Sonar image validation (accepts pre-computed features) ───────
-
-function validateSonar(
-  gray: Float32Array,
-  edges: Float32Array,
-  variance: Float32Array,
-  w: number,
-  h: number
-): ValidationResult {
-  const { spread, mean } = histogram(gray);
-
-  let edgeSum = 0;
-  let varSum = 0;
-  let edgePixels = 0;
-  for (let i = 0; i < edges.length; i++) {
-    edgeSum += edges[i];
-    varSum += variance[i];
-    if (edges[i] > 40) edgePixels++;
-  }
-  const edgeMean = edgeSum / edges.length;
-  const varMean = varSum / variance.length;
-  const edgeDensity = edgePixels / edges.length;
-  const aspectRatio = w / h;
-
-  const metrics = {
-    grayscaleRatio: 1.0,
-    edgeDensity,
-    textureVariance: varMean,
-    histogramSpread: spread,
-    aspectRatio,
-  };
-
-  let score = 0;
-  const reasons: string[] = [];
-
-  if (edgeDensity > 0.02 && edgeDensity < 0.35) {
-    score += 25;
-  } else if (edgeDensity < 0.02) {
-    reasons.push('insufficient structural detail');
-  } else {
-    reasons.push('edge pattern inconsistent with sonar');
-  }
-
-  if (mean > 20 && mean < 235) {
-    score += 20;
-  } else {
-    reasons.push('brightness range atypical for sonar imagery');
-  }
-
-  if (varMean > 50 && varMean < 8000) {
-    score += 25;
-  } else if (varMean < 50) {
-    reasons.push('insufficient acoustic texture');
-  } else {
-    reasons.push('texture pattern inconsistent with sonar');
-  }
-
-  if (spread > 40 && spread < 240) {
-    score += 15;
-  } else {
-    reasons.push('tonal range atypical for sonar');
-  }
-
-  if (aspectRatio > 0.5 && aspectRatio < 4.0) {
-    score += 15;
-  } else {
-    reasons.push('aspect ratio unusual for sonar imagery');
-  }
-
-  const isValid = score >= 60;
-  const confidence = Math.min(99, score);
-
-  const reason = isValid
-    ? `Image validated as side-scan sonar (confidence: ${confidence}%). Edge density: ${(edgeDensity * 100).toFixed(1)}%, texture variance: ${varMean.toFixed(0)}, tonal range: ${spread} levels.`
-    : `Image does not appear to be side-scan sonar. ${reasons.join('; ')}. Edge density: ${(edgeDensity * 100).toFixed(1)}%, texture variance: ${varMean.toFixed(0)}.`;
-
-  return { isValid, confidence, reason, metrics };
-}
-
-// ─── Connected component labeling (pointer-based queue, no shift) ─
+// ─── Connected component labeling for ROI detection ───────────────
 
 interface Region {
   bbox: BoundingBox;
@@ -262,48 +267,43 @@ function connectedComponents(
   const labels = new Int32Array(w * h);
   let currentLabel = 0;
   const regions: Region[] = [];
-  const queue = new Int32Array(w * h);
 
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const idx = y * w + x;
       if (mask[idx] === 1 && labels[idx] === 0) {
         currentLabel++;
-        let qHead = 0;
-        let qTail = 0;
-        queue[qTail++] = idx;
+        const queue: number[] = [idx];
         labels[idx] = currentLabel;
         let minX = x, maxX = x, minY = y, maxY = y;
         let area = 0;
         let sumX = 0, sumY = 0;
 
-        while (qHead < qTail) {
-          const p = queue[qHead++];
+        while (queue.length > 0) {
+          const p = queue.shift()!;
           const px = p % w;
-          const py = (p / w) | 0;
+          const py = Math.floor(p / w);
           area++;
           sumX += px;
           sumY += py;
-          if (px < minX) minX = px;
-          if (px > maxX) maxX = px;
-          if (py < minY) minY = py;
-          if (py > maxY) maxY = py;
+          minX = Math.min(minX, px);
+          maxX = Math.max(maxX, px);
+          minY = Math.min(minY, py);
+          maxY = Math.max(maxY, py);
 
-          if (px > 0 && mask[p - 1] === 1 && labels[p - 1] === 0) {
-            labels[p - 1] = currentLabel;
-            queue[qTail++] = p - 1;
-          }
-          if (px < w - 1 && mask[p + 1] === 1 && labels[p + 1] === 0) {
-            labels[p + 1] = currentLabel;
-            queue[qTail++] = p + 1;
-          }
-          if (py > 0 && mask[p - w] === 1 && labels[p - w] === 0) {
-            labels[p - w] = currentLabel;
-            queue[qTail++] = p - w;
-          }
-          if (py < h - 1 && mask[p + w] === 1 && labels[p + w] === 0) {
-            labels[p + w] = currentLabel;
-            queue[qTail++] = p + w;
+          const neighbors = [
+            p - 1, p + 1, p - w, p + w,
+            p - w - 1, p - w + 1, p + w - 1, p + w + 1,
+          ];
+          for (const n of neighbors) {
+            if (n >= 0 && n < w * h && mask[n] === 1 && labels[n] === 0) {
+              const nx = n % w;
+              const ny = Math.floor(n / w);
+              if (Math.abs(nx - px) <= 1 && Math.abs(ny - py) <= 1) {
+                labels[n] = currentLabel;
+                queue.push(n);
+              }
+            }
           }
         }
 
@@ -332,10 +332,12 @@ function detectROIs(
   edges: Float32Array,
   variance: Float32Array,
   w: number,
-  h: number,
-  edgeMax: number,
-  varMax: number
+  h: number
 ): Region[] {
+  // Create a saliency mask: pixels that have high edge or high texture variance
+  const edgeMax = arrayMax(edges);
+  const varMax = arrayMax(variance);
+
   const mask = new Uint8Array(w * h);
   const edgeThresh = edgeMax * 0.25;
   const varThresh = varMax * 0.2;
@@ -346,27 +348,30 @@ function detectROIs(
     }
   }
 
-  // Dilation with radius 1 (3x3 kernel)
+  // Morphological dilation to connect nearby regions
   const dilated = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       let val = 0;
-      for (let dy = -1; dy <= 1 && !val; dy++) {
-        for (let dx = -1; dx <= 1 && !val; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        for (let dx = -2; dx <= 2; dx++) {
           const nx = x + dx;
           const ny = y + dy;
           if (nx >= 0 && nx < w && ny >= 0 && ny < h && mask[ny * w + nx] === 1) {
             val = 1;
+            break;
           }
         }
+        if (val) break;
       }
       dilated[y * w + x] = val;
     }
   }
 
-  const minArea = Math.max(80, Math.floor(w * h * 0.003));
+  const minArea = Math.max(100, Math.floor(w * h * 0.002));
   const regions = connectedComponents(dilated, w, h, minArea);
 
+  // Compute region statistics
   for (const region of regions) {
     let bSum = 0, vSum = 0, eSum = 0, count = 0;
     for (let y = region.bbox.y; y < region.bbox.y + region.bbox.height; y++) {
@@ -383,6 +388,7 @@ function detectROIs(
     region.meanEdge = eSum / count;
   }
 
+  // Sort by area descending, take top N
   regions.sort((a, b) => b.area - a.area);
   return regions.slice(0, 9);
 }
@@ -393,24 +399,37 @@ function classifyRegion(region: Region, w: number, h: number): { label: Detectio
   const aspect = region.bbox.width / Math.max(1, region.bbox.height);
   const sizeRatio = region.area / (w * h);
 
+  // Anomaly: very high edge density, unusual shape, or extreme brightness
   if (region.meanEdge > 120 && sizeRatio > 0.05) {
     return { label: 'anomaly', isAnomaly: true };
   }
+
+  // Fishing net: elongated, high texture variance
   if (aspect > 2.5 && region.meanVariance > 500) {
     return { label: 'fishing_net', isAnomaly: false };
   }
+
+  // Tire: roughly circular, high edge, dark center
   if (aspect > 0.7 && aspect < 1.4 && region.meanEdge > 60 && region.meanBrightness < 100) {
     return { label: 'tire', isAnomaly: false };
   }
+
+  // Barrel: moderate size, high brightness contrast
   if (sizeRatio > 0.02 && sizeRatio < 0.08 && region.meanBrightness > 120) {
     return { label: 'barrel', isAnomaly: false };
   }
+
+  // Shipwreck debris: large, irregular
   if (sizeRatio > 0.06) {
     return { label: 'shipwreck_debris', isAnomaly: false };
   }
+
+  // Metal fragment: small, high edge
   if (region.area < w * h * 0.01 && region.meanEdge > 50) {
     return { label: 'metal_fragment', isAnomaly: false };
   }
+
+  // Plastic debris: default for moderate objects
   return { label: 'plastic_debris', isAnomaly: false };
 }
 
@@ -423,6 +442,7 @@ function computeConfidence(region: Region, edgeMax: number, varMax: number): num
 }
 
 function shadowDetected(region: Region, gray: Float32Array, w: number): boolean {
+  // Check if there's a darker region adjacent to the bottom of the bbox
   const shadowY = Math.min(region.bbox.y + region.bbox.height + 5, Math.floor(gray.length / w) - 1);
   if (shadowY >= Math.floor(gray.length / w)) return false;
   let shadowBrightness = 0;
@@ -438,19 +458,19 @@ function shadowDetected(region: Region, gray: Float32Array, w: number): boolean 
   return shadowBrightness / count < region.meanBrightness * 0.6;
 }
 
-// ─── Model 1: YOLO-style detection ───────────────────────────────
+// ─── Model 1: YOLO-style detection (bounding boxes) ──────────────
 
 function runYoloDetection(
   gray: Float32Array,
   edges: Float32Array,
   variance: Float32Array,
   w: number,
-  h: number,
-  edgeMax: number,
-  varMax: number
+  h: number
 ): ModelDetection {
   const start = performance.now();
-  const regions = detectROIs(gray, edges, variance, w, h, edgeMax, varMax);
+  const regions = detectROIs(gray, edges, variance, w, h);
+  const edgeMax = arrayMax(edges);
+  const varMax = arrayMax(variance);
 
   const detections: Detection[] = regions.map((region, i) => {
     const { label, isAnomaly } = classifyRegion(region, w, h);
@@ -482,14 +502,17 @@ function runYoloDetection(
 // ─── Model 2: U-Net-style segmentation mask ───────────────────────
 
 function runUnetSegmentation(
+  gray: Float32Array,
   edges: Float32Array,
   variance: Float32Array,
   w: number,
-  h: number,
-  edgeMax: number,
-  varMax: number
+  h: number
 ): { model: ModelDetection; segmentation: SegmentationResult } {
   const start = performance.now();
+
+  // Create segmentation mask: pixels with high edge or variance are "debris"
+  const edgeMax = arrayMax(edges);
+  const varMax = arrayMax(variance);
   const edgeThresh = edgeMax * 0.2;
   const varThresh = varMax * 0.15;
 
@@ -499,12 +522,11 @@ function runUnetSegmentation(
   const maskCtx = maskCanvas.getContext('2d')!;
   const maskImg = maskCtx.createImageData(w, h);
 
-  const mask = new Uint8Array(w * h);
   let maskPixels = 0;
   for (let i = 0; i < w * h; i++) {
     const isDebris = edges[i] > edgeThresh || variance[i] > varThresh;
-    mask[i] = isDebris ? 1 : 0;
     if (isDebris) maskPixels++;
+    // Color: debris = cyan overlay, background = transparent
     maskImg.data[i * 4] = isDebris ? 6 : 0;
     maskImg.data[i * 4 + 1] = isDebris ? 182 : 0;
     maskImg.data[i * 4 + 2] = isDebris ? 212 : 0;
@@ -513,24 +535,32 @@ function runUnetSegmentation(
   maskCtx.putImageData(maskImg, 0, 0);
 
   const coveragePercent = Math.round((maskPixels / (w * h)) * 1000) / 10;
+
+  // Count regions in mask
+  const mask = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    mask[i] = (edges[i] > edgeThresh || variance[i] > varThresh) ? 1 : 0;
+  }
   const regions = connectedComponents(mask, w, h, Math.max(50, Math.floor(w * h * 0.001)));
+
   const elapsed = Math.round(performance.now() - start);
 
-  return {
-    model: {
-      model: 'unet',
-      detections: [],
-      processingTimeMs: elapsed,
-      maskCoverage: coveragePercent,
-      confidence: Math.min(95, coveragePercent * 3),
-    },
-    segmentation: {
-      maskDataUrl: maskCanvas.toDataURL('image/png'),
-      coveragePercent,
-      regionCount: regions.length,
-      processingTimeMs: elapsed,
-    },
+  const model: ModelDetection = {
+    model: 'unet',
+    detections: [],
+    processingTimeMs: elapsed,
+    maskCoverage: coveragePercent,
+    confidence: Math.min(95, coveragePercent * 3),
   };
+
+  const segmentation: SegmentationResult = {
+    maskDataUrl: maskCanvas.toDataURL('image/png'),
+    coveragePercent,
+    regionCount: regions.length,
+    processingTimeMs: elapsed,
+  };
+
+  return { model, segmentation };
 }
 
 // ─── Model 3: Faster R-CNN-style detection ───────────────────────
@@ -540,32 +570,38 @@ function runRcnnDetection(
   edges: Float32Array,
   variance: Float32Array,
   w: number,
-  h: number,
-  edgeMax: number,
-  varMax: number
+  h: number
 ): ModelDetection {
   const start = performance.now();
+
+  // R-CNN uses region proposals — slightly different thresholding
+  const edgeMax = arrayMax(edges);
+  const varMax = arrayMax(variance);
+
+  // More selective than YOLO (higher thresholds)
+  const mask = new Uint8Array(w * h);
   const edgeThresh = edgeMax * 0.35;
   const varThresh = varMax * 0.3;
 
-  const mask = new Uint8Array(w * h);
   for (let i = 0; i < w * h; i++) {
     if (edges[i] > edgeThresh && variance[i] > varThresh) {
       mask[i] = 1;
     }
   }
 
-  const minArea = Math.max(120, Math.floor(w * h * 0.004));
+  const minArea = Math.max(150, Math.floor(w * h * 0.003));
   const regions = connectedComponents(mask, w, h, minArea);
 
   const detections: Detection[] = regions.map((region, i) => {
     const { label, isAnomaly } = classifyRegion(region, w, h);
+    // R-CNN tends to be more precise but may miss objects
     const conf = computeConfidence(region, edgeMax, varMax);
+    const adjustedConf = Math.round(Math.min(97, conf * 1.05) * 10) / 10;
     return {
       id: `rcnn-${i}-${Date.now()}`,
       label,
       labelDisplay: LABEL_DISPLAY[label],
-      confidence: Math.round(Math.min(97, conf * 1.05) * 10) / 10,
+      confidence: adjustedConf,
       bbox: region.bbox,
       isAnomaly,
       area_m2: Math.round((region.area * 0.004) * 100) / 100,
@@ -622,6 +658,7 @@ function fuseModels(
     };
   }
 
+  // Match YOLO and R-CNN detections by IoU
   const matched: { yolo?: Detection; rcnn?: Detection; iou: number }[] = [];
   const usedRcnn = new Set<number>();
 
@@ -644,52 +681,77 @@ function fuseModels(
     }
   }
 
+  // Add unmatched R-CNN detections
   for (let i = 0; i < rcnn.detections.length; i++) {
     if (!usedRcnn.has(i)) {
       matched.push({ rcnn: rcnn.detections[i], iou: 0 });
     }
   }
 
+  // Build fused detections
   const finalDetections: Detection[] = matched.map((m, idx) => {
     if (m.yolo && m.rcnn && m.iou > 0.3) {
+      // Both models agree — high confidence
       const avgConf = (m.yolo.confidence + m.rcnn.confidence) / 2;
       const fusedConf = Math.min(98, avgConf + 5);
       return {
         ...m.yolo,
         id: `fusion-${idx}-${Date.now()}`,
         confidence: Math.round(fusedConf * 10) / 10,
-        source: 'fusion' as const,
+        source: 'fusion',
       };
     } else if (m.yolo) {
+      // Only YOLO detected
       return { ...m.yolo, id: `fusion-${idx}-${Date.now()}`, source: 'fusion' as const };
     } else if (m.rcnn) {
+      // Only R-CNN detected
       return { ...m.rcnn, id: `fusion-${idx}-${Date.now()}`, source: 'fusion' as const };
     }
     return m.yolo!;
   });
 
+  // Agreement scores
+  const bothDetected = matched.filter((m) => m.yolo && m.rcnn).length;
   const agreed = matched.filter((m) => m.iou > 0.3).length;
   const yoloAgreement = yolo.detections.length > 0
-    ? Math.round((agreed / yolo.detections.length) * 100) : 0;
+    ? Math.round((agreed / yolo.detections.length) * 100)
+    : 0;
   const rcnnAgreement = rcnn.detections.length > 0
-    ? Math.round((agreed / rcnn.detections.length) * 100) : 0;
-  const unetAgreement = segmentation.coveragePercent > 3
-    ? 60 + Math.min(35, segmentation.coveragePercent * 2) : 0;
-  const overallAgreement = Math.round((yoloAgreement + rcnnAgreement + unetAgreement) / 3);
+    ? Math.round((agreed / rcnn.detections.length) * 100)
+    : 0;
+  const unetAgreement = segmentation.coveragePercent > 3 ? 60 + Math.min(35, segmentation.coveragePercent * 2) : 0;
 
+  const overallAgreement = Math.round(
+    (yoloAgreement + rcnnAgreement + unetAgreement) / 3
+  );
+
+  // Disagreement notes
   const yoloOnly = matched.filter((m) => m.yolo && !m.rcnn).length;
   const rcnnOnly = matched.filter((m) => m.rcnn && !m.yolo).length;
 
-  if (yoloOnly > 0) notes.push(`YOLO detected ${yoloOnly} object(s) that Faster R-CNN did not confirm`);
-  if (rcnnOnly > 0) notes.push(`Faster R-CNN detected ${rcnnOnly} object(s) that YOLO did not confirm`);
-  if (agreed > 0 && agreed === matched.filter((m) => m.yolo && m.rcnn).length) {
+  if (yoloOnly > 0) {
+    notes.push(`YOLO detected ${yoloOnly} object(s) that Faster R-CNN did not confirm`);
+  }
+  if (rcnnOnly > 0) {
+    notes.push(`Faster R-CNN detected ${rcnnOnly} object(s) that YOLO did not confirm`);
+  }
+  if (agreed > 0 && agreed === bothDetected) {
     notes.push(`Both detection models agree on all ${agreed} matched object(s)`);
   }
-  if (segmentation.coveragePercent < 1) notes.push('U-Net segmentation found minimal debris coverage');
-  else if (segmentation.coveragePercent > 15) notes.push(`U-Net segmentation indicates significant debris coverage (${segmentation.coveragePercent}%)`);
+  if (segmentation.coveragePercent < 1) {
+    notes.push('U-Net segmentation found minimal debris coverage');
+  } else if (segmentation.coveragePercent > 15) {
+    notes.push(`U-Net segmentation indicates significant debris coverage (${segmentation.coveragePercent}%)`);
+  }
 
-  const decision: FusionResult['decision'] =
-    overallAgreement >= 75 ? 'consensus' : overallAgreement >= 50 ? 'partial_agreement' : 'disagreement';
+  let decision: FusionResult['decision'];
+  if (overallAgreement >= 75) {
+    decision = 'consensus';
+  } else if (overallAgreement >= 50) {
+    decision = 'partial_agreement';
+  } else {
+    decision = 'disagreement';
+  }
 
   const summary = `${finalDetections.length} object(s) detected. Model agreement: ${overallAgreement}% (${decision.replace('_', ' ')}). YOLO: ${yolo.detections.length}, R-CNN: ${rcnn.detections.length}, U-Net coverage: ${segmentation.coveragePercent}%.`;
 
@@ -715,27 +777,17 @@ export async function runFullAnalysis(
   const startTime = performance.now();
 
   const img = await loadImage(imageDataUrl);
-  const canvas = imageToCanvas(img, MAX_DIM);
+  const canvas = imageToCanvas(img, 1024);
   const w = canvas.width;
   const h = canvas.height;
   const imageData = getImageData(canvas);
   const imageHash = computeImageHash(canvas);
 
+  // Preprocessing: grayscale
   const gray = toGrayscale(imageData);
 
-  // Compute features ONCE — reused by validation and all three models
-  const edges = sobelEdges(gray, w, h);
-  await new Promise((r) => setTimeout(r, 0));
-
-  const variance = localVariance(gray, w, h, 3);
-  await new Promise((r) => setTimeout(r, 0));
-
-  const edgeMax = arrayMax(edges);
-  const varMax = arrayMax(variance);
-
-  // Validate using pre-computed features
-  const validation = validateSonar(gray, edges, variance, w, h);
-
+  // Sonar validation
+  const validation = validateSonar(gray, w, h);
   if (!validation.isValid) {
     return {
       analysisId,
@@ -765,17 +817,25 @@ export async function runFullAnalysis(
     };
   }
 
-  // Run three models with yields between each
-  const yolo = runYoloDetection(gray, edges, variance, w, h, edgeMax, varMax);
+  // Feature extraction
+  const edges = sobelEdges(gray, w, h);
+  const variance = localVariance(gray, w, h, 3);
+
+  // Yield to event loop before heavy model processing
   await new Promise((r) => setTimeout(r, 0));
 
-  const unetResult = runUnetSegmentation(edges, variance, w, h, edgeMax, varMax);
-  await new Promise((r) => setTimeout(r, 0));
+  // Run three models
+  const yolo = runYoloDetection(gray, edges, variance, w, h);
+  const unetResult = runUnetSegmentation(gray, edges, variance, w, h);
+  const rcnn = runRcnnDetection(gray, edges, variance, w, h);
 
-  const rcnn = runRcnnDetection(gray, edges, variance, w, h, edgeMax, varMax);
-
+  // Fuse results
   const fusion = fuseModels(yolo, unetResult.model, rcnn, unetResult.segmentation);
+
+  // Filter by threshold
   const filteredDetections = fusion.finalDetections.filter((d) => d.confidence >= threshold);
+
+  const elapsed = Math.round(performance.now() - startTime);
 
   return {
     analysisId,
@@ -783,7 +843,7 @@ export async function runFullAnalysis(
     detections: filteredDetections,
     imageWidth: img.naturalWidth,
     imageHeight: img.naturalHeight,
-    processingTimeMs: Math.round(performance.now() - startTime),
+    processingTimeMs: elapsed,
     modelVersion: MODEL_VERSION,
     threshold,
     yolo,
