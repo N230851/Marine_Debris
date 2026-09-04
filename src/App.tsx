@@ -25,7 +25,7 @@ import StatsPanel from '@/components/StatsPanel';
 import FusionPanel from '@/components/FusionPanel';
 import AssistantPanel from '@/components/AssistantPanel';
 import ValidationPanel from '@/components/ValidationPanel';
-import { runFullAnalysis, computeImageHash } from '@/lib/detection';
+import { runFullAnalysis } from '@/lib/detection';
 import { generateAssistantAnalysis } from '@/lib/assistant';
 import { generateGeoLocation } from '@/lib/geotagging';
 import { supabase } from '@/lib/supabase';
